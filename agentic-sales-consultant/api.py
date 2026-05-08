@@ -1,0 +1,421 @@
+import asyncio
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+from core.router import orchestrate
+from core.lead_capture import (
+    save_lead, get_all_leads,
+    get_lead_count
+)
+from core.followup_agent import schedule_followup
+from core.database import (
+    update_session, get_history,
+    get_all_leads_db, get_session,
+    update_lead_status
+)
+from openai import OpenAI
+import os
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+
+CORS(app,
+     resources={r"/*": {"origins": "*"}},
+     allow_headers=["Content-Type", "Authorization",
+                    "Access-Control-Allow-Origin"],
+     methods=["GET", "POST", "OPTIONS"],
+     supports_credentials=False)
+
+CALENDLY_LINK = os.getenv(
+    "CALENDLY_LINK", "https://calendly.com/your-link"
+)
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+DECISION_INTENTS = ["PRICING", "ONBOARDING"]
+
+
+@app.after_request
+def after_request(response):
+    """Ensure CORS headers on every response."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = \
+        "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = \
+        "Content-Type, Authorization"
+    return response
+
+
+@app.before_request
+def handle_preflight():
+    """Handle OPTIONS preflight requests explicitly."""
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = \
+            "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = \
+            "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "3600"
+        return response, 200
+
+
+def is_user_ready_to_book(message, conversation_history):
+    """
+    Uses GPT to determine if user genuinely wants to book.
+    Accepts high OR medium confidence to avoid missing
+    clear but contextual confirmations like "yes, now".
+    """
+    try:
+        history_text = ""
+        if conversation_history:
+            history_text = "\n".join([
+                f"{'User' if m['role'] == 'user' else 'Agent'}: "
+                f"{m['content']}"
+                for m in conversation_history[-8:]
+            ])
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a booking intent classifier for a sales chatbot.
+
+Your job is to determine if the user wants to book a strategy call
+based on the full conversation context.
+
+Read the ENTIRE conversation carefully before deciding.
+A short reply like "yes" or "yes, now" or "do it" can be a clear
+booking confirmation IF the previous agent message asked about booking.
+
+Think about what the user was responding TO:
+- If the agent just asked "want to book a strategy call?" and user says
+  "yes" -> that IS booking intent, confidence HIGH
+- If the agent asked about services and user says "yes" ->
+  that is agreement, NOT booking, confidence LOW
+- "provide the link" or "give me the link" after booking discussion ->
+  HIGH confidence booking intent
+- "do it now" or "let's do it" after booking discussion ->
+  HIGH confidence booking intent
+
+Return JSON:
+{
+  "ready": true or false,
+  "confidence": "high", "medium", or "low",
+  "reason": "one sentence explanation"
+}"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Full conversation:
+{history_text}
+
+Latest user message: "{message}"
+
+Is this user ready to book right now?"""
+                }
+            ],
+            max_tokens=100,
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(
+            response.choices[0].message.content.strip()
+        )
+
+        ready = result.get("ready", False)
+        confidence = result.get("confidence", "low")
+        reason = result.get("reason", "")
+
+        print(
+            f"DEBUG BOOKING CHECK: ready={ready}, "
+            f"confidence={confidence}, reason={reason}"
+        )
+
+        return ready is True and confidence in ("high", "medium")
+
+    except Exception as e:
+        print(f"Booking check error: {e}")
+        return False
+
+
+@app.route("/chat", methods=["POST", "OPTIONS"])
+def chat():
+    if request.method == "OPTIONS":
+        return make_response(), 200
+
+    data = request.json
+    user_message = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
+    user_name = data.get("name")
+    user_email = data.get("email")
+    user_phone = data.get("phone")
+    user_business = data.get("business")
+
+    if not user_message:
+        return jsonify({"error": "Empty message"}), 400
+
+    history = get_history(session_id)
+    session = get_session(session_id)
+    session["session_id"] = session_id
+    session["name"] = user_name
+    session["email"] = user_email
+    session["phone"] = user_phone
+    session["business"] = user_business
+
+    (response, intent, stage,
+     message_count, lead_score,
+     lead_score_reason, next_action,
+     conversation_summary,
+     conversation_history,
+     cta_in_this_response) = asyncio.run(
+        orchestrate(user_message, history, session)
+    )
+
+    if user_email or user_phone:
+        updates = {}
+        if user_email:
+            updates["email_provided"] = True
+        if user_phone:
+            updates["phone_provided"] = True
+        if updates:
+            update_session(session_id, updates)
+
+    history = get_history(session_id)
+
+    assistant_messages = [
+        msg for msg in history
+        if msg.get("role") == "assistant"
+    ]
+    previous_assistant_messages = (
+        assistant_messages[:-1]
+        if assistant_messages else []
+    )
+
+    cta_previously_shown = any(
+        "strategy call" in msg.get("content", "").lower() and
+        "book" in msg.get("content", "").lower()
+        for msg in previous_assistant_messages
+    )
+
+    print(
+        f"DEBUG CALENDLY STATE: "
+        f"stage={stage}, "
+        f"message_count={message_count}, "
+        f"cta_previously_shown={cta_previously_shown}, "
+        f"cta_in_this_response={cta_in_this_response}"
+    )
+
+    show_calendly = False
+
+    if stage == "DECISION" and message_count >= 3:
+
+        if cta_in_this_response:
+            print("DEBUG: CTA shown this turn - waiting for response")
+
+        elif cta_previously_shown:
+            print("DEBUG: CTA previously shown - checking booking intent")
+            show_calendly = is_user_ready_to_book(
+                user_message, history
+            )
+            if show_calendly:
+                print("DEBUG: Calendly triggered - user responded to CTA")
+
+        else:
+            print("DEBUG: No CTA yet - checking explicit booking")
+            show_calendly = is_user_ready_to_book(
+                user_message, history
+            )
+            if show_calendly:
+                print("DEBUG: Calendly triggered - explicit booking request")
+
+    elif stage != "DECISION":
+        print(f"DEBUG: Stage is {stage} - Calendly not checked")
+    elif message_count < 3:
+        print(f"DEBUG: Message count {message_count} < 3")
+
+    if (intent in DECISION_INTENTS or
+            stage == "DECISION" or user_email):
+        lead = save_lead(
+            session_id=session_id,
+            name=user_name,
+            email=user_email,
+            phone=user_phone,
+            business=user_business,
+            intent=intent,
+            stage=stage,
+            conversation_summary=conversation_summary,
+            lead_score=lead_score,
+            conversation_history=conversation_history,
+            lead_score_reason=lead_score_reason,
+            next_action=next_action,
+            last_user_message=user_message
+        )
+        if lead and lead.get("email"):
+            schedule_followup(session_id)
+
+    return jsonify({
+        "response": response,
+        "intent": intent,
+        "stage": stage,
+        "message_count": message_count,
+        "lead_score": lead_score,
+        "lead_score_reason": lead_score_reason,
+        "next_action": next_action,
+        "show_calendly": show_calendly,
+        "calendly_link": CALENDLY_LINK if show_calendly else None,
+        "session_id": session_id
+    })
+
+
+@app.route("/leads", methods=["GET", "OPTIONS"])
+def leads():
+    if request.method == "OPTIONS":
+        return make_response(), 200
+    return jsonify({
+        "total": len(get_all_leads()),
+        "leads": get_all_leads()
+    })
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    leads = []
+
+    for data in get_all_leads_db():
+        session_id = data.get("session_id", "")
+        conversation_history = data.get("conversation_history", [])
+
+        if isinstance(conversation_history, str):
+            try:
+                conversation_history = json.loads(
+                    conversation_history
+                )
+            except Exception:
+                conversation_history = get_history(session_id)
+
+        leads.append({
+            "session_id": session_id,
+            "name": data.get("name", "Unknown"),
+            "email": data.get("email", ""),
+            "business": data.get("business", ""),
+            "intent": data.get("intent", "SERVICE"),
+            "emotion": data.get("emotion", "neutral"),
+            "lead_score": data.get("lead_score", 0),
+            "stage": data.get("stage", "awareness"),
+            "last_message_time": data.get("last_updated", ""),
+            "conversation_history": conversation_history,
+        })
+
+    return {"leads": leads}
+
+
+@app.route("/health", methods=["GET", "OPTIONS"])
+def health():
+    if request.method == "OPTIONS":
+        return make_response(), 200
+    return jsonify({
+        "status": "Chanakya is online",
+        "leads_captured": get_lead_count()
+    })
+
+
+@app.route("/conversations/<session_id>", methods=["GET", "OPTIONS"])
+def get_conversation(session_id):
+    """
+    Returns full conversation history for a session.
+    Used by dashboard to show transcript in detail panel.
+    Fetches directly from Supabase conversations table.
+    """
+    if request.method == "OPTIONS":
+        return make_response(), 200
+    history = get_history(session_id)
+    return jsonify({
+        "session_id": session_id,
+        "history": history,
+        "count": len(history)
+    })
+
+
+@app.route(
+    "/leads/<session_id>/status",
+    methods=["POST", "OPTIONS"]
+)
+def set_lead_status(session_id):
+    if request.method == "OPTIONS":
+        return make_response(), 200
+
+    data = request.json or {}
+    status = (data.get("status") or "").strip().lower()
+    valid_statuses = {
+        "new", "contacted", "qualified",
+        "followup_sent", "closed_won",
+        "closed_lost"
+    }
+
+    if status not in valid_statuses:
+        return jsonify({
+            "success": False,
+            "message": "Invalid status"
+        }), 400
+
+    update_lead_status(session_id, status)
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "status": status
+    })
+
+
+@app.route("/capture-lead", methods=["POST", "OPTIONS"])
+def capture_lead():
+    if request.method == "OPTIONS":
+        return make_response(), 200
+
+    data = request.json
+    session_id = data.get("session_id", "default")
+
+    if not session_id or session_id == "default":
+        return jsonify({
+            "success": False,
+            "message": "Invalid session ID"
+        }), 400
+
+    existing_leads = get_all_leads_db()
+    existing = next(
+        (l for l in existing_leads
+         if l["session_id"] == session_id),
+        None
+    )
+    existing_score = (
+        existing.get("lead_score", 1)
+        if existing else 1
+    )
+
+    lead = save_lead(
+        session_id=session_id,
+        name=data.get("name"),
+        email=data.get("email"),
+        phone=data.get("phone"),
+        business=data.get("business"),
+        intent="manual_capture",
+        stage="captured",
+        lead_score=existing_score,
+        next_action="Follow up immediately"
+    )
+    if lead and lead.get("email"):
+        schedule_followup(session_id)
+
+    return jsonify({
+        "success": True,
+        "message": "Lead captured successfully",
+        "lead": lead
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(debug=False, host="0.0.0.0", port=port)
