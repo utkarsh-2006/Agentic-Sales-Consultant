@@ -107,7 +107,7 @@
         }
 
         #dashboard-screen {
-            display: none;
+            display: block;
         }
 
         .db-header {
@@ -1296,23 +1296,6 @@
 
 <body>
 
-    <!-- LOGIN -->
-    <div id="login-screen">
-        <div class="login-card">
-            <div class="login-logo">GrowthForge<span>.</span></div>
-            <div class="login-sub">Team access for GrowthForge operators and closers.</div>
-            <label class="login-label">Team Password</label>
-            <input type="password" class="login-input" id="pwd-input" placeholder="Enter team password"
-                onkeydown="if(event.key==='Enter') doLogin()" />
-            <button class="login-btn" onclick="doLogin()">
-                Open Dashboard
-            </button>
-            <div class="login-error" id="login-err">
-                Incorrect password. Please try again.
-            </div>
-        </div>
-    </div>
-
     <!-- DASHBOARD -->
     <div id="dashboard-screen">
         <div class="db-header">
@@ -1327,7 +1310,6 @@
                 </div>
                 <div id="last-updated" style="font-size:11px;
                     color:rgba(255,255,255,0.25);"></div>
-                <button class="logout-btn" onclick="doLogout()">Sign Out</button>
             </div>
         </div>
 
@@ -1455,38 +1437,11 @@
         const API_BASE = "http://127.0.0.1:10000";
         const API = `${API_BASE}/leads`;
         const CONV_API = `${API_BASE}/conversations`;
-        const TEAM_PASSWORD = "growthforge2025";
 
         let allLeads = [];
         let currentLead = null;
 
-        // AUTH
-        function doLogin() {
-            const val = document.getElementById('pwd-input').value;
-            const err = document.getElementById('login-err');
-            if (val === TEAM_PASSWORD) {
-                sessionStorage.setItem('gf_auth', '1');
-                document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('dashboard-screen').style.display = 'block';
-                err.style.display = 'none';
-                loadData();
-            } else {
-                err.style.display = 'block';
-                document.getElementById('pwd-input').value = '';
-                document.getElementById('pwd-input').focus();
-            }
-        }
-
-        function doLogout() {
-            sessionStorage.removeItem('gf_auth');
-            location.reload();
-        }
-
-        if (sessionStorage.getItem('gf_auth') === '1') {
-            document.getElementById('login-screen').style.display = 'none';
-            document.getElementById('dashboard-screen').style.display = 'block';
-            loadData();
-        }
+        loadData();
 
         // HELPERS
         function fmtDate(str) {
@@ -2105,7 +2060,7 @@
 
         // AUTO REFRESH
         setInterval(() => {
-            if (sessionStorage.getItem('gf_auth') === '1') loadData();
+            loadData();
         }, 30000);
     </script>
 </body>
