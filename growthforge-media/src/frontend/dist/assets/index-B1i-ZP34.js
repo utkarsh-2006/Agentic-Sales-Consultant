@@ -14667,11 +14667,10 @@ async function sendChatMessage(payload) {
   return data;
 }
 const CHAT_DETAILS_STORAGE_KEY = "growthforge_chat_details";
+const CHAT_CAPTURE_STATUS_KEY = "growthforge_capture_status";
 const initialLeadDetails = {
   name: "",
-  email: "",
-  phone: "",
-  business: ""
+  email: ""
 };
 const initialMessage = {
   id: "welcome",
@@ -14681,6 +14680,41 @@ const initialMessage = {
 function createMessageId(prefix2) {
   return `${prefix2}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+function formatPersonName(value) {
+  return value.trim().split(/\s+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join(" ");
+}
+function persistLeadDetails(details) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(CHAT_DETAILS_STORAGE_KEY, JSON.stringify(details));
+}
+function persistCaptureStatus(value) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(CHAT_CAPTURE_STATUS_KEY, value);
+}
+function shouldStartLeadCapture(data) {
+  const highIntentIntents = /* @__PURE__ */ new Set(["PRICING", "ROI", "CASE", "ONBOARDING"]);
+  return data.message_count >= 2 || data.stage === "DECISION" || data.lead_score >= 5 || data.show_calendly || highIntentIntents.has(data.intent);
+}
+function buildEmailPrompt(data, name) {
+  const opener = name ? `Thanks, ${name}. ` : "";
+  if (data.intent === "PRICING") {
+    return `${opener}I can send the pricing breakdown and next-step options. What's the best email for that? You can type 'skip' if you'd rather not share it.`;
+  }
+  if (data.intent === "CASE" || data.intent === "ROI") {
+    return `${opener}I can send proof points and relevant case studies. What's the best email for that? You can type 'skip' if you'd rather not share it.`;
+  }
+  if (data.intent === "ONBOARDING" || data.show_calendly) {
+    return `${opener}I can send the booking link and follow-up details. What's the best email to use? You can type 'skip' if you'd rather not share it.`;
+  }
+  return `${opener}What's the best email to send follow-up notes or next steps? You can type 'skip' if you'd rather not share it.`;
+}
 function ChatWidget() {
   const [isOpen, setIsOpen] = reactExports.useState(false);
   const [input, setInput] = reactExports.useState("");
@@ -14689,14 +14723,23 @@ function ChatWidget() {
   const [error, setError] = reactExports.useState(null);
   const [calendlyLink, setCalendlyLink] = reactExports.useState(null);
   const [leadDetails, setLeadDetails] = reactExports.useState(initialLeadDetails);
-  const [detailsSubmitted, setDetailsSubmitted] = reactExports.useState(false);
-  const [isSavingDetails, setIsSavingDetails] = reactExports.useState(false);
+  const [captureCard, setCaptureCard] = reactExports.useState("none");
+  const [capturePrompt, setCapturePrompt] = reactExports.useState("");
+  const [captureValue, setCaptureValue] = reactExports.useState("");
+  const [isSavingCapture, setIsSavingCapture] = reactExports.useState(false);
+  const [captureSuccessMessage, setCaptureSuccessMessage] = reactExports.useState(null);
+  const [hasPromptedForLead, setHasPromptedForLead] = reactExports.useState(false);
+  const [emailCaptureReady, setEmailCaptureReady] = reactExports.useState(false);
   const messagesEndRef = reactExports.useRef(null);
   reactExports.useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
     const storedLeadDetails = window.localStorage.getItem(CHAT_DETAILS_STORAGE_KEY);
+    const captureStatus = window.localStorage.getItem(CHAT_CAPTURE_STATUS_KEY);
+    if (captureStatus === "dismissed" || captureStatus === "complete") {
+      setHasPromptedForLead(true);
+    }
     if (!storedLeadDetails) {
       return;
     }
@@ -14704,13 +14747,12 @@ function ChatWidget() {
       const parsedLeadDetails = JSON.parse(storedLeadDetails);
       const hydratedLeadDetails = {
         name: parsedLeadDetails.name ?? "",
-        email: parsedLeadDetails.email ?? "",
-        phone: parsedLeadDetails.phone ?? "",
-        business: parsedLeadDetails.business ?? ""
+        email: parsedLeadDetails.email ?? ""
       };
       setLeadDetails(hydratedLeadDetails);
       if (hydratedLeadDetails.name && hydratedLeadDetails.email) {
-        setDetailsSubmitted(true);
+        setHasPromptedForLead(true);
+        persistCaptureStatus("complete");
       }
     } catch {
       window.localStorage.removeItem(CHAT_DETAILS_STORAGE_KEY);
@@ -14719,60 +14761,115 @@ function ChatWidget() {
   reactExports.useEffect(() => {
     var _a2;
     (_a2 = messagesEndRef.current) == null ? void 0 : _a2.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isOpen, detailsSubmitted]);
-  const handleLeadDetailsChange = (e) => {
-    const { name, value } = e.target;
-    setLeadDetails((prev) => ({ ...prev, [name]: value }));
-  };
-  const handleLeadDetailsSubmit = async (e) => {
-    e.preventDefault();
-    setError(null);
-    setIsSavingDetails(true);
-    try {
-      const sessionId = getSessionId();
-      const normalizedLeadDetails = {
-        name: leadDetails.name.trim(),
-        email: leadDetails.email.trim(),
-        phone: leadDetails.phone.trim(),
-        business: leadDetails.business.trim()
-      };
-      await captureLead({
-        session_id: sessionId,
-        name: normalizedLeadDetails.name,
-        email: normalizedLeadDetails.email,
-        phone: normalizedLeadDetails.phone || void 0,
-        business: normalizedLeadDetails.business || void 0
-      });
-      setLeadDetails(normalizedLeadDetails);
-      setDetailsSubmitted(true);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(
-          CHAT_DETAILS_STORAGE_KEY,
-          JSON.stringify(normalizedLeadDetails)
-        );
+  }, [messages, isOpen, captureCard, calendlyLink, isSavingCapture]);
+  const appendAssistantMessage = (content) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: createMessageId("assistant"),
+        role: "assistant",
+        content
       }
-      setMessages(
-        (prev) => prev.some((message) => message.id === "details-confirmed") ? prev : [
-          ...prev,
-          {
-            id: "details-confirmed",
-            role: "assistant",
-            content: `Thanks, ${normalizedLeadDetails.name}. I'm ready whenever you are.`
-          }
-        ]
-      );
+    ]);
+  };
+  const openCaptureCard = (type, prompt) => {
+    setCapturePrompt(prompt);
+    setCaptureValue("");
+    setCaptureSuccessMessage(null);
+    setCaptureCard(type);
+    setError(null);
+  };
+  const requestLeadDetailsIfNeeded = (data) => {
+    if (hasPromptedForLead && !emailCaptureReady) {
+      return;
+    }
+    if (!shouldStartLeadCapture(data)) {
+      return;
+    }
+    if (!leadDetails.name) {
+      openCaptureCard("name", "Before we go deeper, what should I call you?");
+      setHasPromptedForLead(true);
+      persistCaptureStatus("pending");
+      return;
+    }
+    if (!leadDetails.email && emailCaptureReady) {
+      openCaptureCard("email", buildEmailPrompt(data, leadDetails.name));
+      setEmailCaptureReady(false);
+      setHasPromptedForLead(true);
+      persistCaptureStatus("pending");
+    }
+  };
+  const handleSkipCapture = () => {
+    setCaptureCard("none");
+    setCaptureValue("");
+    setCaptureSuccessMessage(null);
+    setEmailCaptureReady(false);
+    persistCaptureStatus("dismissed");
+  };
+  const saveName = () => {
+    const trimmedValue = captureValue.trim();
+    if (trimmedValue.length < 2 || trimmedValue.includes("@")) {
+      setError("Please enter your name here.");
+      return;
+    }
+    const normalizedName = formatPersonName(trimmedValue);
+    const nextLeadDetails = {
+      ...leadDetails,
+      name: normalizedName
+    };
+    setLeadDetails(nextLeadDetails);
+    persistLeadDetails(nextLeadDetails);
+    setCaptureValue("");
+    setCaptureSuccessMessage("Saved. Keep going.");
+    setEmailCaptureReady(true);
+    setError(null);
+  };
+  const saveEmail = async () => {
+    const trimmedValue = captureValue.trim();
+    if (!isValidEmail(trimmedValue)) {
+      setError("Please enter a valid email.");
+      return;
+    }
+    const nextLeadDetails = {
+      ...leadDetails,
+      email: trimmedValue
+    };
+    setIsSavingCapture(true);
+    setError(null);
+    try {
+      await captureLead({
+        session_id: getSessionId(),
+        name: nextLeadDetails.name || "Website Visitor",
+        email: nextLeadDetails.email
+      });
+      setLeadDetails(nextLeadDetails);
+      persistLeadDetails(nextLeadDetails);
+      persistCaptureStatus("complete");
+      setCaptureValue("");
+      setCaptureSuccessMessage("Saved. I have it.");
+      setEmailCaptureReady(false);
     } catch (err) {
       setError(
         err instanceof Error && err.message ? err.message : "Unable to save your details right now."
       );
     } finally {
-      setIsSavingDetails(false);
+      setIsSavingCapture(false);
+    }
+  };
+  const handleCaptureSubmit = async (e) => {
+    e.preventDefault();
+    if (captureCard === "name") {
+      saveName();
+      return;
+    }
+    if (captureCard === "email") {
+      await saveEmail();
     }
   };
   const handleSubmit = async (e) => {
     e.preventDefault();
     const trimmedInput = input.trim();
-    if (!trimmedInput || isSending || !detailsSubmitted) {
+    if (!trimmedInput || isSending) {
       return;
     }
     const userMessage = {
@@ -14790,19 +14887,11 @@ function ChatWidget() {
         session_id: getSessionId(),
         message: trimmedInput,
         name: leadDetails.name || void 0,
-        email: leadDetails.email || void 0,
-        phone: leadDetails.phone || void 0,
-        business: leadDetails.business || void 0
+        email: leadDetails.email || void 0
       });
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: createMessageId("assistant"),
-          role: "assistant",
-          content: data.response
-        }
-      ]);
+      appendAssistantMessage(data.response);
       setCalendlyLink(data.show_calendly ? data.calendly_link : null);
+      requestLeadDetailsIfNeeded(data);
     } catch (err) {
       setError(
         err instanceof Error && err.message ? err.message : "Something went wrong while sending your message."
@@ -14812,114 +14901,41 @@ function ChatWidget() {
     }
   };
   return /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "fixed bottom-6 right-6 z-[60]", children: isOpen ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "w-[calc(100vw-2rem)] max-w-sm overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.22)]", children: [
-    /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "gradient-brand px-5 py-4 text-white", children: /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-start justify-between gap-4", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "text-sm font-semibold uppercase tracking-[0.18em] text-white/80", children: "AI Sales Agent" }),
-        /* @__PURE__ */ jsxRuntimeExports.jsx("h3", { className: "mt-1 text-lg font-semibold", children: "Chat with Chanakya" }),
-        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "mt-1 text-sm text-white/85", children: "Get instant answers about services, pricing, and next steps." })
-      ] }),
-      /* @__PURE__ */ jsxRuntimeExports.jsx(
-        "button",
-        {
-          type: "button",
-          onClick: () => setIsOpen(false),
-          className: "rounded-full bg-white/15 p-2 text-white transition-colors hover:bg-white/25",
-          "aria-label": "Close chat",
-          children: /* @__PURE__ */ jsxRuntimeExports.jsx(
-            "svg",
-            {
-              "aria-hidden": "true",
-              className: "h-4 w-4",
-              fill: "none",
-              stroke: "currentColor",
-              strokeWidth: "2",
-              viewBox: "0 0 24 24",
-              children: /* @__PURE__ */ jsxRuntimeExports.jsx("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M6 18L18 6M6 6l12 12" })
-            }
-          )
-        }
-      )
-    ] }) }),
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "max-h-[26rem] space-y-4 overflow-y-auto bg-slate-50 px-4 py-4", children: [
-      !detailsSubmitted && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "rounded-2xl border border-indigo-200 bg-white px-4 py-4 shadow-sm", children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "mb-4", children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm font-semibold text-slate-900", children: "Before we start, introduce yourself" }),
-          /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "mt-1 text-sm text-slate-500", children: "Share your details once and I'll personalize the conversation from there." })
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "gradient-brand px-5 py-4 text-white", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-start justify-between gap-4", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "text-sm font-semibold uppercase tracking-[0.18em] text-white/80", children: "AI Sales Agent" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("h3", { className: "mt-1 text-lg font-semibold", children: "Chat with Chanakya" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "mt-1 text-sm text-white/85", children: "Ask your question first. I will only ask for details when they are useful." })
         ] }),
-        /* @__PURE__ */ jsxRuntimeExports.jsxs("form", { onSubmit: handleLeadDetailsSubmit, className: "space-y-3", children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { htmlFor: "chat-name", className: "mb-1 block text-xs font-medium text-slate-600", children: "Full Name" }),
-            /* @__PURE__ */ jsxRuntimeExports.jsx(
-              "input",
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            type: "button",
+            onClick: () => setIsOpen(false),
+            className: "rounded-full bg-white/15 p-2 text-white transition-colors hover:bg-white/25",
+            "aria-label": "Close chat",
+            children: /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "svg",
               {
-                id: "chat-name",
-                name: "name",
-                type: "text",
-                required: true,
-                value: leadDetails.name,
-                onChange: handleLeadDetailsChange,
-                placeholder: "John Martinez",
-                className: "w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                "aria-hidden": "true",
+                className: "h-4 w-4",
+                fill: "none",
+                stroke: "currentColor",
+                strokeWidth: "2",
+                viewBox: "0 0 24 24",
+                children: /* @__PURE__ */ jsxRuntimeExports.jsx("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M6 18L18 6M6 6l12 12" })
               }
             )
-          ] }),
-          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { htmlFor: "chat-email", className: "mb-1 block text-xs font-medium text-slate-600", children: "Email Address" }),
-            /* @__PURE__ */ jsxRuntimeExports.jsx(
-              "input",
-              {
-                id: "chat-email",
-                name: "email",
-                type: "email",
-                required: true,
-                value: leadDetails.email,
-                onChange: handleLeadDetailsChange,
-                placeholder: "john@example.com",
-                className: "w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-              }
-            )
-          ] }),
-          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { htmlFor: "chat-phone", className: "mb-1 block text-xs font-medium text-slate-600", children: "Phone Number" }),
-            /* @__PURE__ */ jsxRuntimeExports.jsx(
-              "input",
-              {
-                id: "chat-phone",
-                name: "phone",
-                type: "tel",
-                value: leadDetails.phone,
-                onChange: handleLeadDetailsChange,
-                placeholder: "(555) 123-4567",
-                className: "w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-              }
-            )
-          ] }),
-          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
-            /* @__PURE__ */ jsxRuntimeExports.jsx("label", { htmlFor: "chat-business", className: "mb-1 block text-xs font-medium text-slate-600", children: "Business Name" }),
-            /* @__PURE__ */ jsxRuntimeExports.jsx(
-              "input",
-              {
-                id: "chat-business",
-                name: "business",
-                type: "text",
-                value: leadDetails.business,
-                onChange: handleLeadDetailsChange,
-                placeholder: "SafeFlow Plumbing",
-                className: "w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
-              }
-            )
-          ] }),
-          /* @__PURE__ */ jsxRuntimeExports.jsx(
-            "button",
-            {
-              type: "submit",
-              disabled: isSavingDetails,
-              className: "inline-flex w-full items-center justify-center rounded-2xl px-4 py-3 font-semibold text-white gradient-brand transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60",
-              children: isSavingDetails ? "Saving details..." : "Start chatting"
-            }
-          )
-        ] })
+          }
+        )
       ] }),
+      (leadDetails.name || leadDetails.email) && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "mt-4 flex flex-wrap gap-2 text-xs text-white/90", children: [
+        leadDetails.name && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "rounded-full bg-white/16 px-3 py-1.5 font-medium", children: leadDetails.name }),
+        leadDetails.email && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "rounded-full bg-white/16 px-3 py-1.5 font-medium", children: leadDetails.email })
+      ] })
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "max-h-[26rem] space-y-4 overflow-y-auto bg-slate-50 px-4 py-4", children: [
       messages.map((message) => /* @__PURE__ */ jsxRuntimeExports.jsx(
         "div",
         {
@@ -14934,6 +14950,50 @@ function ChatWidget() {
         },
         message.id
       )),
+      captureCard !== "none" && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "rounded-2xl border border-indigo-200 bg-white px-4 py-4 shadow-sm", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-sm font-semibold text-slate-900", children: capturePrompt }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "mt-1 text-sm text-slate-500", children: captureCard === "name" ? "This stays separate from the main conversation." : "I only use this to send the useful follow-up." }),
+        captureSuccessMessage && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700", children: captureSuccessMessage }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("form", { onSubmit: handleCaptureSubmit, className: "mt-4 space-y-3", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: captureCard === "email" ? "email" : "text",
+              value: captureValue,
+              onChange: (e) => setCaptureValue(e.target.value),
+              placeholder: captureCard === "email" ? "joshua@example.com" : "Joshua",
+              className: "w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex gap-3", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                type: "submit",
+                disabled: isSavingCapture || captureValue.trim() === "" || captureSuccessMessage !== null,
+                className: "inline-flex flex-1 items-center justify-center rounded-2xl px-4 py-3 font-semibold text-white gradient-brand transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60",
+                children: isSavingCapture ? "Saving..." : captureCard === "email" ? "Save email" : "Save name"
+              }
+            ),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                type: "button",
+                onClick: () => {
+                  if (captureSuccessMessage) {
+                    setCaptureCard("none");
+                    setCaptureSuccessMessage(null);
+                    return;
+                  }
+                  handleSkipCapture();
+                },
+                className: "inline-flex items-center justify-center rounded-2xl border border-slate-200 px-4 py-3 font-semibold text-slate-600 transition-colors hover:bg-slate-50",
+                children: captureSuccessMessage ? "Continue" : "Skip"
+              }
+            )
+          ] })
+        ] })
+      ] }),
       isSending && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex justify-start", children: /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-500 shadow-sm", children: "Chanakya is thinking..." }) }),
       error && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700", children: error }),
       calendlyLink && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900", children: [
@@ -14974,17 +15034,16 @@ function ChatWidget() {
             id: "chat-message",
             value: input,
             onChange: (e) => setInput(e.target.value),
-            placeholder: detailsSubmitted ? "Ask about pricing, lead quality, onboarding..." : "Enter your details above to begin chatting...",
+            placeholder: "Ask about pricing, lead quality, onboarding...",
             rows: 2,
-            disabled: !detailsSubmitted,
-            className: "min-h-[56px] flex-1 resize-none rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 disabled:cursor-not-allowed disabled:bg-slate-100"
+            className: "min-h-[56px] flex-1 resize-none rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
           }
         ),
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "button",
           {
             type: "submit",
-            disabled: isSending || input.trim() === "" || !detailsSubmitted,
+            disabled: isSending || input.trim() === "",
             className: "inline-flex h-12 shrink-0 items-center justify-center rounded-2xl px-4 font-semibold text-white gradient-brand transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60",
             children: "Send"
           }
