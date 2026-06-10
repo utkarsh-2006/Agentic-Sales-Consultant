@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "http://localhost:10000";
+const DEFAULT_API_BASE_URL = "https://agentic-sales-consultant.onrender.com";
 const SESSION_STORAGE_KEY = "growthforge_session_id";
 
 export interface CaptureLeadPayload {
